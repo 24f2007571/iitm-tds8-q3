@@ -202,7 +202,18 @@ app.post('/promote', (req, res) => {
     }
 
     const eligibleIds = [...results.entries()].filter(([, r]) => r.eligible).map(([id]) => id);
-    const eligibleVersionsSorted = [...eligibleIds].sort((a, b) => Number(a) - Number(b));
+
+    // Rank eligible versions: accuracy desc, latency asc, size asc, version numeric asc
+    const ranked = eligibleIds
+      .map(id => ({ id, ev: results.get(id).ev }))
+      .sort((a, b) => {
+        if (b.ev.accuracy !== a.ev.accuracy) return b.ev.accuracy - a.ev.accuracy;
+        if (a.ev.latencyMs !== b.ev.latencyMs) return a.ev.latencyMs - b.ev.latencyMs;
+        if (a.ev.sizeBytes !== b.ev.sizeBytes) return a.ev.sizeBytes - b.ev.sizeBytes;
+        return Number(a.id) - Number(b.id);
+      });
+
+    const eligibleVersionsSorted = ranked.map(r => r.id);
 
     // Step 6: champion validity check
     const championResult = versionMap.has(championVersion) ? results.get(championVersion) : null;
@@ -219,16 +230,6 @@ app.post('/promote', (req, res) => {
         evidence: null
       });
     }
-
-    // Step 7: rank eligible versions
-    const ranked = eligibleIds
-      .map(id => ({ id, ev: results.get(id).ev }))
-      .sort((a, b) => {
-        if (b.ev.accuracy !== a.ev.accuracy) return b.ev.accuracy - a.ev.accuracy;
-        if (a.ev.latencyMs !== b.ev.latencyMs) return a.ev.latencyMs - b.ev.latencyMs;
-        if (a.ev.sizeBytes !== b.ev.sizeBytes) return a.ev.sizeBytes - b.ev.sizeBytes;
-        return Number(a.id) - Number(b.id);
-      });
 
     const winner = ranked[0];
     const championEv = results.get(championVersion).ev;
