@@ -2,6 +2,14 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
+// Handle malformed JSON bodies gracefully
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'INVALID_INPUT' });
+  }
+  next(err);
+});
+
 const TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
 const CANON_INT_RE = /^[1-9]\d*$/;
 
@@ -27,8 +35,12 @@ function parseTimestamp(ts) {
   if (Number.isNaN(ms)) return null;
   return ms;
 }
+
+// Safe against Object.prototype pollution (e.g. key === "constructor", "toString", etc.)
 function addCode(map, key, code) {
-  if (!map[key]) map[key] = [];
+  if (!Object.prototype.hasOwnProperty.call(map, key) || !Array.isArray(map[key])) {
+    map[key] = [];
+  }
   if (!map[key].includes(code)) map[key].push(code);
 }
 
@@ -44,7 +56,6 @@ function validatePolicy(policy, asOfMs) {
   if (!isNonNegSafeInt(policy.maxSizeBytes)) return false;
   if (!inRange01(policy.minImprovement)) return false;
 
-  // requiredSlices is mandatory and must be a plain object (can be empty {})
   if (
     !policy.requiredSlices ||
     typeof policy.requiredSlices !== 'object' ||
@@ -123,138 +134,142 @@ function evaluateVersion(v, policy, asOfMs) {
 
 // ---------- main endpoint ----------
 app.post('/promote', (req, res) => {
-  const body = req.body;
+  try {
+    const body = req.body;
 
-  if (
-    !body || typeof body !== 'object' ||
-    !body.policy || typeof body.policy !== 'object' || Array.isArray(body.policy) ||
-    !Array.isArray(body.versions) ||
-    typeof body.championVersion !== 'string'
-  ) {
-    return res.status(400).json({ error: 'INVALID_INPUT' });
-  }
-
-  const { policy, versions, championVersion } = body;
-  const asOfMs = parseTimestamp(body.asOf);
-  const failedGates = {};
-
-  // Step 3: canonicalize + dedupe BEFORE building lookup map
-  const counts = new Map();
-  const canonicalList = [];
-
-  versions.forEach((v, idx) => {
-    const id = v && typeof v === 'object' && !Array.isArray(v) ? v.version : undefined;
-    if (!isCanonicalVersion(id)) {
-      // Use index to avoid collisions between multiple invalid entries
-      const key = typeof id === 'string' && id.length > 0 ? id : `__invalid_${idx}`;
-      addCode(failedGates, key, 'INVALID_VERSION');
-      return;
+    if (
+      !body || typeof body !== 'object' ||
+      !body.policy || typeof body.policy !== 'object' || Array.isArray(body.policy) ||
+      !Array.isArray(body.versions) ||
+      typeof body.championVersion !== 'string'
+    ) {
+      return res.status(400).json({ error: 'INVALID_INPUT' });
     }
-    counts.set(id, (counts.get(id) || 0) + 1);
-    canonicalList.push({ id, v });
-  });
 
-  const versionMap = new Map();
-  for (const { id, v } of canonicalList) {
-    if (counts.get(id) > 1) {
-      addCode(failedGates, id, 'DUPLICATE_VERSION');
-      continue;
-    }
-    versionMap.set(id, v);
-  }
+    const { policy, versions, championVersion } = body;
+    const asOfMs = parseTimestamp(body.asOf);
+    const failedGates = {};
 
-  // Step 4: policy validation
-  const policyValid = validatePolicy(policy, asOfMs);
-  if (!policyValid) {
-    for (const id of versionMap.keys()) {
-      addCode(failedGates, id, 'INVALID_POLICY');
-    }
-    return res.json({
-      action: 'block',
-      championVersion,
-      selectedVersion: null,
-      eligibleVersions: [],
-      failedGates,
-      aliasMutation: null,
-      evidence: null
-    });
-  }
+    // Step 3: canonicalize + dedupe BEFORE building lookup map
+    const counts = new Map();
+    const canonicalList = [];
 
-  // Step 5: evaluate each surviving version
-  const results = new Map();
-  for (const [id, v] of versionMap.entries()) {
-    const r = evaluateVersion(v, policy, asOfMs);
-    results.set(id, r);
-    if (r.codes.length) {
-      for (const c of r.codes) addCode(failedGates, id, c);
-    }
-  }
-
-  const eligibleIds = [...results.entries()].filter(([, r]) => r.eligible).map(([id]) => id);
-  const eligibleVersionsSorted = [...eligibleIds].sort((a, b) => Number(a) - Number(b));
-
-  // Step 6: champion validity check
-  const championResult = versionMap.has(championVersion) ? results.get(championVersion) : null;
-  const championValid = championResult && championResult.eligible;
-
-  if (!championValid) {
-    return res.json({
-      action: 'block',
-      championVersion,
-      selectedVersion: null,
-      eligibleVersions: eligibleVersionsSorted,
-      failedGates,
-      aliasMutation: null,
-      evidence: null
-    });
-  }
-
-  // Step 7: rank eligible versions
-  const ranked = eligibleIds
-    .map(id => ({ id, ev: results.get(id).ev }))
-    .sort((a, b) => {
-      if (b.ev.accuracy !== a.ev.accuracy) return b.ev.accuracy - a.ev.accuracy;
-      if (a.ev.latencyMs !== b.ev.latencyMs) return a.ev.latencyMs - b.ev.latencyMs;
-      if (a.ev.sizeBytes !== b.ev.sizeBytes) return a.ev.sizeBytes - b.ev.sizeBytes;
-      return Number(a.id) - Number(b.id);
+    versions.forEach((v, idx) => {
+      const id = v && typeof v === 'object' && !Array.isArray(v) ? v.version : undefined;
+      if (!isCanonicalVersion(id)) {
+        const key = typeof id === 'string' && id.length > 0 ? id : `__invalid_${idx}`;
+        addCode(failedGates, key, 'INVALID_VERSION');
+        return;
+      }
+      counts.set(id, (counts.get(id) || 0) + 1);
+      canonicalList.push({ id, v });
     });
 
-  const winner = ranked[0];
-  const championEv = results.get(championVersion).ev;
+    const versionMap = new Map();
+    for (const { id, v } of canonicalList) {
+      if (counts.get(id) > 1) {
+        addCode(failedGates, id, 'DUPLICATE_VERSION');
+        continue;
+      }
+      versionMap.set(id, v);
+    }
 
-  // Step 8: promote vs retain
-  let action, selectedVersion, evidence, aliasMutation;
+    // Step 4: policy validation
+    const policyValid = validatePolicy(policy, asOfMs);
+    if (!policyValid) {
+      for (const id of versionMap.keys()) {
+        addCode(failedGates, id, 'INVALID_POLICY');
+      }
+      return res.json({
+        action: 'block',
+        championVersion,
+        selectedVersion: null,
+        eligibleVersions: [],
+        failedGates,
+        aliasMutation: null,
+        evidence: null
+      });
+    }
 
-  if (winner.id === championVersion) {
-    action = 'retain';
-    selectedVersion = championVersion;
-    evidence = championEv;
-    aliasMutation = null;
-  } else {
-    const diff = Math.round((winner.ev.accuracy - championEv.accuracy) * 1e12) / 1e12;
-    if (diff >= policy.minImprovement) {
-      action = 'promote';
-      selectedVersion = winner.id;
-      evidence = winner.ev;
-      aliasMutation = { alias: 'champion', version: winner.id };
-    } else {
+    // Step 5: evaluate each surviving version
+    const results = new Map();
+    for (const [id, v] of versionMap.entries()) {
+      const r = evaluateVersion(v, policy, asOfMs);
+      results.set(id, r);
+      if (r.codes.length) {
+        for (const c of r.codes) addCode(failedGates, id, c);
+      }
+    }
+
+    const eligibleIds = [...results.entries()].filter(([, r]) => r.eligible).map(([id]) => id);
+    const eligibleVersionsSorted = [...eligibleIds].sort((a, b) => Number(a) - Number(b));
+
+    // Step 6: champion validity check
+    const championResult = versionMap.has(championVersion) ? results.get(championVersion) : null;
+    const championValid = championResult && championResult.eligible;
+
+    if (!championValid) {
+      return res.json({
+        action: 'block',
+        championVersion,
+        selectedVersion: null,
+        eligibleVersions: eligibleVersionsSorted,
+        failedGates,
+        aliasMutation: null,
+        evidence: null
+      });
+    }
+
+    // Step 7: rank eligible versions
+    const ranked = eligibleIds
+      .map(id => ({ id, ev: results.get(id).ev }))
+      .sort((a, b) => {
+        if (b.ev.accuracy !== a.ev.accuracy) return b.ev.accuracy - a.ev.accuracy;
+        if (a.ev.latencyMs !== b.ev.latencyMs) return a.ev.latencyMs - b.ev.latencyMs;
+        if (a.ev.sizeBytes !== b.ev.sizeBytes) return a.ev.sizeBytes - b.ev.sizeBytes;
+        return Number(a.id) - Number(b.id);
+      });
+
+    const winner = ranked[0];
+    const championEv = results.get(championVersion).ev;
+
+    // Step 8: promote vs retain
+    let action, selectedVersion, evidence, aliasMutation;
+
+    if (winner.id === championVersion) {
       action = 'retain';
       selectedVersion = championVersion;
       evidence = championEv;
       aliasMutation = null;
+    } else {
+      const diff = Math.round((winner.ev.accuracy - championEv.accuracy) * 1e12) / 1e12;
+      if (diff >= policy.minImprovement) {
+        action = 'promote';
+        selectedVersion = winner.id;
+        evidence = winner.ev;
+        aliasMutation = { alias: 'champion', version: winner.id };
+      } else {
+        action = 'retain';
+        selectedVersion = championVersion;
+        evidence = championEv;
+        aliasMutation = null;
+      }
     }
-  }
 
-  // Step 9: build response
-  return res.json({
-    action,
-    championVersion,
-    selectedVersion,
-    eligibleVersions: eligibleVersionsSorted,
-    failedGates,
-    aliasMutation,
-    evidence
-  });
+    // Step 9: build response
+    return res.json({
+      action,
+      championVersion,
+      selectedVersion,
+      eligibleVersions: eligibleVersionsSorted,
+      failedGates,
+      aliasMutation,
+      evidence
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(400).json({ error: 'INVALID_INPUT' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
