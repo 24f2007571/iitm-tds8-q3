@@ -2,7 +2,6 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-// Handle malformed JSON bodies gracefully
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') {
     return res.status(400).json({ error: 'INVALID_INPUT' });
@@ -10,254 +9,368 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-const TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
-const CANON_INT_RE = /^[1-9]\d*$/;
-
-function isFiniteNum(x) {
-  return typeof x === 'number' && Number.isFinite(x);
-}
-function inRange01(x) {
-  return isFiniteNum(x) && x >= 0 && x <= 1;
-}
+// ---------------- shared helpers ----------------
+function isFiniteNum(x) { return typeof x === 'number' && Number.isFinite(x); }
+function inRange01(x) { return isFiniteNum(x) && x >= 0 && x <= 1; }
 function isNonNegSafeInt(x) {
   return typeof x === 'number' && Number.isInteger(x) && x >= 0 && x <= Number.MAX_SAFE_INTEGER;
 }
-function isNonEmptyString(x) {
-  return typeof x === 'string' && x.length > 0;
+function isPosSafeInt(x) {
+  return typeof x === 'number' && Number.isInteger(x) && x > 0 && x <= Number.MAX_SAFE_INTEGER;
 }
-function isCanonicalVersion(v) {
-  return typeof v === 'string' && CANON_INT_RE.test(v);
+function isNonEmptyString(x) { return typeof x === 'string' && x.length > 0; }
+function sortUtf8(arr) {
+  return [...arr].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
-function parseTimestamp(ts) {
-  if (typeof ts !== 'string' || !TS_RE.test(ts)) return null;
-  const ms = Date.parse(ts);
-  if (Number.isNaN(ms)) return null;
-  return ms;
+function sortDedupeCodes(codes) {
+  return sortUtf8([...new Set(codes)]);
 }
 
-function addCode(map, key, code) {
-  if (!Object.prototype.hasOwnProperty.call(map, key) || !Array.isArray(map[key])) {
-    map[key] = [];
-  }
-  if (!map[key].includes(code)) map[key].push(code);
-}
+const HEX40_RE = /^[0-9a-f]{40}$/;
+const HEX64_RE = /^[0-9a-f]{64}$/;
 
-function validatePolicy(policy, asOfMs) {
-  if (asOfMs === null) return false;
+// ================= CHOOSE =================
+const INTERVENTION_ORDER = ['prompt_only', 'retrieval', 'lora', 'qlora'];
+
+function validatePolicyChoose(policy) {
   if (!policy || typeof policy !== 'object' || Array.isArray(policy)) return false;
-  if (!isNonEmptyString(policy.datasetDigest)) return false;
-  if (!isNonEmptyString(policy.schemaDigest)) return false;
-  if (!isNonNegSafeInt(policy.maxAgeSeconds)) return false;
-  if (!inRange01(policy.accuracyFloor)) return false;
+  if (!inRange01(policy.minQuality)) return false;
+  if (typeof policy.freshnessRequired !== 'boolean') return false;
   if (!isFiniteNum(policy.maxLatencyMs) || policy.maxLatencyMs < 0) return false;
-  if (!isNonNegSafeInt(policy.maxSizeBytes)) return false;
-  if (!inRange01(policy.minImprovement)) return false;
-
-  if (
-    !policy.requiredSlices ||
-    typeof policy.requiredSlices !== 'object' ||
-    Array.isArray(policy.requiredSlices)
-  ) {
-    return false;
-  }
-  for (const k of Object.keys(policy.requiredSlices)) {
-    if (!inRange01(policy.requiredSlices[k])) return false;
-  }
-
+  if (!isFiniteNum(policy.maxMemoryMb) || policy.maxMemoryMb < 0) return false;
+  if (!isNonNegSafeInt(policy.maxLabeledExamples)) return false;
+  if (!isFiniteNum(policy.maxTotalCost) || policy.maxTotalCost < 0) return false;
+  if (!isNonNegSafeInt(policy.horizonRequests)) return false;
   return true;
 }
 
-function evaluateVersion(v, policy, asOfMs) {
-  const codes = [];
-  const ev = v.evaluation;
-
-  if (!ev || typeof ev !== 'object' || Array.isArray(ev)) {
-    return { codes: ['MISSING_EVALUATION'], eligible: false, ev: null };
-  }
-
-  const accFinite = isFiniteNum(ev.accuracy);
-  const latFinite = isFiniteNum(ev.latencyMs);
-  const sizeFinite = isFiniteNum(ev.sizeBytes);
-  if (!accFinite || !latFinite || !sizeFinite) codes.push('NON_FINITE');
-
-  if (accFinite && (ev.accuracy < 0 || ev.accuracy > 1)) codes.push('METRIC_RANGE');
-  if (latFinite && ev.latencyMs < 0) codes.push('METRIC_RANGE');
-  if (sizeFinite && ev.sizeBytes < 0) codes.push('METRIC_RANGE');
-
-  const createdMs = parseTimestamp(ev.createdAt);
-  if (createdMs === null) {
-    codes.push('INVALID_TIMESTAMP');
-  } else {
-    if (createdMs > asOfMs) codes.push('FUTURE_EVALUATION');
-    else if (createdMs < asOfMs - policy.maxAgeSeconds * 1000) codes.push('STALE_EVALUATION');
-  }
-
-  if (!isNonEmptyString(ev.artifactDigest) || ev.artifactDigest !== v.artifactDigest) {
-    codes.push('ARTIFACT_MISMATCH');
-  }
-  if (!isNonEmptyString(ev.datasetDigest) || ev.datasetDigest !== policy.datasetDigest) {
-    codes.push('DATASET_MISMATCH');
-  }
-  if (!isNonEmptyString(ev.schemaDigest) || ev.schemaDigest !== policy.schemaDigest) {
-    codes.push('SCHEMA_MISMATCH');
-  }
-
-  if (accFinite && ev.accuracy < policy.accuracyFloor) codes.push('ACCURACY_FLOOR');
-  if (latFinite && ev.latencyMs > policy.maxLatencyMs) codes.push('LATENCY_LIMIT');
-  if (sizeFinite && ev.sizeBytes > policy.maxSizeBytes) codes.push('SIZE_LIMIT');
-
-  const slices = (ev.slices && typeof ev.slices === 'object' && !Array.isArray(ev.slices)) ? ev.slices : {};
-  const requiredSlices = policy.requiredSlices || {};
-  for (const name of Object.keys(requiredSlices)) {
-    const floor = requiredSlices[name];
-    if (!(name in slices)) {
-      codes.push(`MISSING_SLICE:${name}`);
-      continue;
-    }
-    const val = slices[name];
-    if (!inRange01(val)) {
-      codes.push(`SLICE_RANGE:${name}`);
-      continue;
-    }
-    if (val < floor) {
-      codes.push(`SLICE_FLOOR:${name}`);
-    }
-  }
-
-  const uniqueSorted = [...new Set(codes)].sort();
-  return { codes: uniqueSorted, eligible: uniqueSorted.length === 0, ev };
+function validateCandidateShape(c) {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
+  if (!INTERVENTION_ORDER.includes(c.name)) return false;
+  if (typeof c.available !== 'boolean') return false;
+  if (!inRange01(c.quality)) return false;
+  if (typeof c.freshness !== 'boolean') return false;
+  if (!isFiniteNum(c.latencyMs) || c.latencyMs < 0) return false;
+  if (!isFiniteNum(c.memoryMb) || c.memoryMb < 0) return false;
+  if (!isNonNegSafeInt(c.labeledExamples)) return false;
+  if (!isFiniteNum(c.oneTimeCost) || c.oneTimeCost < 0) return false;
+  if (!isFiniteNum(c.recurringCost) || c.recurringCost < 0) return false;
+  return true;
 }
 
-app.post('/promote', (req, res) => {
-  try {
-    const body = req.body;
+function handleChoose(body, res) {
+  const { policy, candidates } = body;
 
-    if (
-      !body || typeof body !== 'object' ||
-      !body.policy || typeof body.policy !== 'object' || Array.isArray(body.policy) ||
-      !Array.isArray(body.versions) ||
-      typeof body.championVersion !== 'string'
-    ) {
+  if (!validatePolicyChoose(policy) || !Array.isArray(candidates)) {
+    return res.status(400).json({ error: 'INVALID_INPUT' });
+  }
+
+  // Exactly one candidate per required name, no extras
+  const byName = new Map();
+  for (const c of candidates) {
+    const name = c && typeof c === 'object' ? c.name : undefined;
+    if (!INTERVENTION_ORDER.includes(name) || byName.has(name)) {
       return res.status(400).json({ error: 'INVALID_INPUT' });
     }
+    byName.set(name, c);
+  }
+  if (byName.size !== INTERVENTION_ORDER.length) {
+    return res.status(400).json({ error: 'INVALID_INPUT' });
+  }
 
-    const { policy, versions, championVersion } = body;
-    const asOfMs = parseTimestamp(body.asOf);
-    const failedGates = {};
+  const totalCosts = {};
+  const reasonCodes = {};
+  const eligibleFlags = {};
 
-    const counts = new Map();
-    const canonicalList = [];
+  for (const name of INTERVENTION_ORDER) {
+    const c = byName.get(name);
+    const codes = [];
 
-    versions.forEach((v, idx) => {
-      const id = v && typeof v === 'object' && !Array.isArray(v) ? v.version : undefined;
-      if (!isCanonicalVersion(id)) {
-        const key = typeof id === 'string' && id.length > 0 ? id : `__invalid_${idx}`;
-        addCode(failedGates, key, 'INVALID_VERSION');
-        return;
-      }
-      counts.set(id, (counts.get(id) || 0) + 1);
-      canonicalList.push({ id, v });
-    });
-
-    const versionMap = new Map();
-    for (const { id, v } of canonicalList) {
-      if (counts.get(id) > 1) {
-        addCode(failedGates, id, 'DUPLICATE_VERSION');
-        continue;
-      }
-      versionMap.set(id, v);
+    if (!validateCandidateShape(c)) {
+      codes.push('INVALID_INPUT');
+      reasonCodes[name] = sortDedupeCodes(codes);
+      totalCosts[name] = 0;
+      eligibleFlags[name] = false;
+      continue;
     }
 
-    const policyValid = validatePolicy(policy, asOfMs);
-    if (!policyValid) {
-      for (const id of versionMap.keys()) {
-        addCode(failedGates, id, 'INVALID_POLICY');
-      }
-      return res.json({
-        action: 'block',
-        championVersion,
-        selectedVersion: null,
-        eligibleVersions: [],
-        failedGates,
-        aliasMutation: null,
-        evidence: null
-      });
+    const totalCost = Math.round(
+      (c.oneTimeCost + policy.horizonRequests * c.recurringCost) * 1e12
+    ) / 1e12;
+    totalCosts[name] = totalCost;
+
+    if (!c.available) codes.push('UNAVAILABLE');
+    if (c.quality < policy.minQuality) codes.push('QUALITY_FLOOR');
+    if (policy.freshnessRequired && !c.freshness) codes.push('FRESHNESS_REQUIRED');
+    if (c.latencyMs > policy.maxLatencyMs) codes.push('LATENCY_LIMIT');
+    if (c.memoryMb > policy.maxMemoryMb) codes.push('MEMORY_LIMIT');
+    if (c.labeledExamples > policy.maxLabeledExamples) codes.push('DATA_LIMIT');
+    if (totalCost > policy.maxTotalCost) codes.push('COST_LIMIT');
+
+    reasonCodes[name] = sortDedupeCodes(codes);
+    eligibleFlags[name] = codes.length === 0;
+  }
+
+  const eligible = INTERVENTION_ORDER.filter(name => eligibleFlags[name]);
+  const selected = eligible.length > 0 ? eligible[0] : null;
+
+  return res.json({ selected, eligible, totalCosts, reasonCodes });
+}
+
+// ================= REPAIR =================
+const VALID_ROLES = new Set(['system', 'user', 'assistant']);
+
+function computeLabels(tokens) {
+  if (!Array.isArray(tokens) || tokens.length === 0) {
+    return { labels: [], valid: false, code: 'INVALID_TOKEN' };
+  }
+  let allValid = true;
+  for (const t of tokens) {
+    if (
+      !t || typeof t !== 'object' ||
+      !isNonNegSafeInt(t.id) ||
+      !VALID_ROLES.has(t.role) ||
+      typeof t.padding !== 'boolean' ||
+      typeof t.text !== 'string'
+    ) {
+      allValid = false;
+      break;
     }
+  }
+  if (!allValid) {
+    return { labels: tokens.map(() => -100), valid: false, code: 'INVALID_TOKEN' };
+  }
+  const labels = tokens.map(t => (t.role === 'assistant' && t.padding === false ? t.id : -100));
+  return { labels, valid: true, code: null };
+}
 
-    const results = new Map();
-    for (const [id, v] of versionMap.entries()) {
-      if (!Object.prototype.hasOwnProperty.call(failedGates, id)) {
-        failedGates[id] = [];
-      }
-      const r = evaluateVersion(v, policy, asOfMs);
-      results.set(id, r);
-      if (r.codes.length) {
-        for (const c of r.codes) addCode(failedGates, id, c);
-      }
+function checkTemplate(templateApplications) {
+  return templateApplications === 1;
+}
+
+function checkParameters(parameters, allowedTargets) {
+  const codes = [];
+  const result = { trainableParams: [], trainableCount: 0, pass: false };
+
+  const paramsOk = Array.isArray(parameters) && parameters.length > 0 &&
+    parameters.every(p => p && typeof p === 'object' &&
+      isNonEmptyString(p.name) && isNonEmptyString(p.target) && isPosSafeInt(p.numel));
+
+  const namesUnique = paramsOk && new Set(parameters.map(p => p.name)).size === parameters.length;
+
+  const targetsOk = Array.isArray(allowedTargets) && allowedTargets.length > 0 &&
+    allowedTargets.every(t => isNonEmptyString(t)) &&
+    new Set(allowedTargets).size === allowedTargets.length;
+
+  if (!paramsOk || !namesUnique || !targetsOk) {
+    codes.push('INVALID_PARAMETER');
+    return { ...result, codes };
+  }
+
+  const allowedSet = new Set(allowedTargets);
+  const trainable = parameters.filter(p =>
+    allowedSet.has(p.target) &&
+    (p.name.endsWith('.lora_A.weight') || p.name.endsWith('.lora_B.weight'))
+  );
+
+  if (trainable.length === 0) {
+    codes.push('INVALID_PARAMETER');
+    return { ...result, codes };
+  }
+
+  const sortedTrainable = sortUtf8(trainable.map(p => p.name));
+  let sum = 0n;
+  for (const p of trainable) sum += BigInt(p.numel);
+  const trainableCount = sum <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(sum) : Number.MAX_SAFE_INTEGER;
+
+  return {
+    trainableParams: sortedTrainable,
+    trainableCount,
+    pass: true,
+    codes: []
+  };
+}
+
+function checkEvalIsolation(trainRowIds, evalRowIds) {
+  const isValidIdArray = (arr) =>
+    Array.isArray(arr) && arr.length > 0 &&
+    arr.every(x => isNonEmptyString(x)) &&
+    new Set(arr).size === arr.length;
+
+  if (!isValidIdArray(trainRowIds) || !isValidIdArray(evalRowIds)) {
+    return { pass: false, code: 'EVAL_LEAKAGE' };
+  }
+  const trainSet = new Set(trainRowIds);
+  const overlap = evalRowIds.some(id => trainSet.has(id));
+  if (overlap) {
+    return { pass: false, code: 'EVAL_LEAKAGE' };
+  }
+  return { pass: true, code: null };
+}
+
+function checkArtifactFiles(artifactFiles) {
+  const required = ['adapter_config.json', 'adapter_model.safetensors'];
+  const codes = [];
+
+  if (!Array.isArray(artifactFiles)) {
+    codes.push('ADAPTER_FILE_SET');
+    return { adapterFiles: [], codes };
+  }
+
+  const sorted = sortUtf8([...new Set(artifactFiles)]);
+  const requiredSorted = sortUtf8(required);
+
+  const hasDuplicates = new Set(artifactFiles).size !== artifactFiles.length;
+  const exactMatch = !hasDuplicates &&
+    sorted.length === requiredSorted.length &&
+    sorted.every((f, i) => f === requiredSorted[i]);
+
+  if (!exactMatch) {
+    codes.push('ADAPTER_FILE_SET');
+    // Flag full-model artifact if something outside the adapter set is present
+    const hasExtra = artifactFiles.some(f => !required.includes(f));
+    if (hasExtra) codes.push('FULL_MODEL_ARTIFACT');
+  }
+
+  return { adapterFiles: sorted, codes };
+}
+
+function checkLineage(baseRevision, datasetDigest, codeDigest, configDigest, expectedDigests) {
+  const codes = [];
+
+  if (!isNonEmptyString(baseRevision) || !HEX40_RE.test(baseRevision)) {
+    codes.push('MUTABLE_BASE_REVISION');
+  }
+
+  const digestsFormatValid =
+    isNonEmptyString(datasetDigest) && HEX64_RE.test(datasetDigest) &&
+    isNonEmptyString(codeDigest) && HEX64_RE.test(codeDigest) &&
+    isNonEmptyString(configDigest) && HEX64_RE.test(configDigest);
+
+  if (!digestsFormatValid) {
+    codes.push('LINEAGE_MISMATCH');
+  } else if (expectedDigests && typeof expectedDigests === 'object') {
+    const mismatches =
+      (expectedDigests.datasetDigest !== undefined && expectedDigests.datasetDigest !== datasetDigest) ||
+      (expectedDigests.codeDigest !== undefined && expectedDigests.codeDigest !== codeDigest) ||
+      (expectedDigests.configDigest !== undefined && expectedDigests.configDigest !== configDigest);
+    if (mismatches) codes.push('LINEAGE_MISMATCH');
+  }
+
+  return { pass: codes.length === 0, codes };
+}
+
+function checkBatch(microBatch, gradientAccumulation, replicas, expectedEffectiveBatch) {
+  const allPos = [microBatch, gradientAccumulation, replicas, expectedEffectiveBatch].every(isPosSafeInt);
+  if (!allPos) return false;
+  return microBatch * gradientAccumulation * replicas === expectedEffectiveBatch;
+}
+
+function checkCheckpoint(checkpoint) {
+  const required = ['model', 'optimizer', 'scheduler', 'step', 'rng', 'dataPosition'];
+  if (!checkpoint || typeof checkpoint !== 'object' || Array.isArray(checkpoint)) return false;
+  return required.every(k => Object.prototype.hasOwnProperty.call(checkpoint, k));
+}
+
+function checkResume(uninterruptedWeights, resumedWeights, resumeTolerance) {
+  const isValidArr = (arr) =>
+    Array.isArray(arr) && arr.length > 0 && arr.every(isFiniteNum);
+
+  if (!isValidArr(uninterruptedWeights) || !isValidArr(resumedWeights)) return false;
+  if (uninterruptedWeights.length !== resumedWeights.length) return false;
+  if (!isFiniteNum(resumeTolerance) || resumeTolerance < 0) return false;
+
+  for (let i = 0; i < uninterruptedWeights.length; i++) {
+    if (Math.abs(uninterruptedWeights[i] - resumedWeights[i]) > resumeTolerance) return false;
+  }
+  return true;
+}
+
+function handleRepair(body, res) {
+  const reasonCodes = [];
+
+  // 1. Tokens
+  const { labels, valid: tokensValid, code: tokenCode } = computeLabels(body.tokens);
+  if (!tokensValid) reasonCodes.push(tokenCode);
+
+  // 2. Template
+  const templatePass = checkTemplate(body.templateApplications);
+  if (!templatePass) reasonCodes.push('CHAT_TEMPLATE_COUNT');
+
+  // 3. Parameters / PEFT config
+  const paramResult = checkParameters(body.parameters, body.allowedTargets);
+  if (paramResult.codes.length) reasonCodes.push(...paramResult.codes);
+  const peftConfigPass = paramResult.pass;
+
+  // 4. Inference mode / dropout -> evaluationDeterministic
+  let evaluationDeterministic = true;
+  if (body.inferenceMode !== false) {
+    reasonCodes.push('INFERENCE_MODE');
+    evaluationDeterministic = false;
+  }
+  if (body.dropoutActiveDuringEval !== false) {
+    reasonCodes.push('EVAL_DROPOUT_ACTIVE');
+    evaluationDeterministic = false;
+  }
+
+  // 5. Eval isolation
+  const isoResult = checkEvalIsolation(body.trainRowIds, body.evalRowIds);
+  if (!isoResult.pass) reasonCodes.push(isoResult.code);
+  const evalIsolated = isoResult.pass;
+
+  // 6. Artifact files
+  const artifactResult = checkArtifactFiles(body.artifactFiles);
+  if (artifactResult.codes.length) reasonCodes.push(...artifactResult.codes);
+
+  // 7. Lineage
+  const lineageResult = checkLineage(
+    body.baseRevision, body.datasetDigest, body.codeDigest, body.configDigest, body.expectedDigests
+  );
+  if (lineageResult.codes.length) reasonCodes.push(...lineageResult.codes);
+
+  // 8. Batch
+  const batchOk = checkBatch(
+    body.microBatch, body.gradientAccumulation, body.replicas, body.expectedEffectiveBatch
+  );
+  if (!batchOk) reasonCodes.push('EFFECTIVE_BATCH_MISMATCH');
+  if (!batchOk) lineageResult.pass = false; // batch mismatch also invalidates lineage pass per spec grouping? kept separate below
+
+  // 9. Checkpoint
+  const checkpointComplete = checkCheckpoint(body.checkpoint);
+  if (!checkpointComplete) reasonCodes.push('INCOMPLETE_CHECKPOINT');
+
+  // 10. Resume
+  const resumePass = checkResume(body.uninterruptedWeights, body.resumedWeights, body.resumeTolerance);
+  if (!resumePass) reasonCodes.push('RESUME_DIVERGENCE');
+
+  const lineagePass = lineageResult.pass && batchOk;
+
+  return res.json({
+    labels,
+    templatePass,
+    trainableParams: paramResult.trainableParams,
+    trainableCount: paramResult.trainableCount,
+    peftConfigPass,
+    adapterFiles: artifactResult.adapterFiles,
+    checkpointComplete,
+    lineagePass,
+    evalIsolated,
+    evaluationDeterministic,
+    resumePass,
+    reasonCodes: sortDedupeCodes(reasonCodes)
+  });
+}
+
+// ================= ROUTE =================
+app.post('/adapt', (req, res) => {
+  try {
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ error: 'INVALID_INPUT' });
     }
-
-    const eligibleIds = [...results.entries()].filter(([, r]) => r.eligible).map(([id]) => id);
-
-    const ranked = eligibleIds
-      .map(id => ({ id, ev: results.get(id).ev }))
-      .sort((a, b) => {
-        if (b.ev.accuracy !== a.ev.accuracy) return b.ev.accuracy - a.ev.accuracy;
-        if (a.ev.latencyMs !== b.ev.latencyMs) return a.ev.latencyMs - b.ev.latencyMs;
-        if (a.ev.sizeBytes !== b.ev.sizeBytes) return a.ev.sizeBytes - b.ev.sizeBytes;
-        return Number(a.id) - Number(b.id);
-      });
-
-    const eligibleVersionsSorted = ranked.map(r => r.id);
-
-    const championResult = versionMap.has(championVersion) ? results.get(championVersion) : null;
-    const championValid = championResult && championResult.eligible;
-
-    if (!championValid) {
-      return res.json({
-        action: 'block',
-        championVersion,
-        selectedVersion: null,
-        eligibleVersions: eligibleVersionsSorted,
-        failedGates,
-        aliasMutation: null,
-        evidence: null
-      });
-    }
-
-    const winner = ranked[0];
-    const championEv = results.get(championVersion).ev;
-
-    let action, selectedVersion, evidence, aliasMutation;
-
-    if (winner.id === championVersion) {
-      action = 'retain';
-      selectedVersion = championVersion;
-      evidence = championEv;
-      aliasMutation = null;
-    } else {
-      const diff = Math.round((winner.ev.accuracy - championEv.accuracy) * 1e12) / 1e12;
-      if (diff >= policy.minImprovement) {
-        action = 'promote';
-        selectedVersion = winner.id;
-        evidence = winner.ev;
-        aliasMutation = { alias: 'champion', version: winner.id };
-      } else {
-        action = 'retain';
-        selectedVersion = championVersion;
-        evidence = championEv;
-        aliasMutation = null;
-      }
-    }
-
-    return res.json({
-      action,
-      championVersion,
-      selectedVersion,
-      eligibleVersions: eligibleVersionsSorted,
-      failedGates,
-      aliasMutation,
-      evidence
-    });
+    if (body.operation === 'choose') return handleChoose(body, res);
+    if (body.operation === 'repair') return handleRepair(body, res);
+    return res.status(400).json({ error: 'INVALID_INPUT' });
   } catch (err) {
     console.error(err);
     return res.status(400).json({ error: 'INVALID_INPUT' });
