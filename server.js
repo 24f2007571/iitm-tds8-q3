@@ -43,12 +43,19 @@ function validatePolicy(policy, asOfMs) {
   if (!isFiniteNum(policy.maxLatencyMs) || policy.maxLatencyMs < 0) return false;
   if (!isNonNegSafeInt(policy.maxSizeBytes)) return false;
   if (!inRange01(policy.minImprovement)) return false;
-  if (policy.requiredSlices !== undefined && policy.requiredSlices !== null) {
-    if (typeof policy.requiredSlices !== 'object' || Array.isArray(policy.requiredSlices)) return false;
-    for (const k of Object.keys(policy.requiredSlices)) {
-      if (!inRange01(policy.requiredSlices[k])) return false;
-    }
+
+  // requiredSlices is mandatory and must be a plain object (can be empty {})
+  if (
+    !policy.requiredSlices ||
+    typeof policy.requiredSlices !== 'object' ||
+    Array.isArray(policy.requiredSlices)
+  ) {
+    return false;
   }
+  for (const k of Object.keys(policy.requiredSlices)) {
+    if (!inRange01(policy.requiredSlices[k])) return false;
+  }
+
   return true;
 }
 
@@ -135,16 +142,17 @@ app.post('/promote', (req, res) => {
   const counts = new Map();
   const canonicalList = [];
 
-  for (const v of versions) {
+  versions.forEach((v, idx) => {
     const id = v && typeof v === 'object' && !Array.isArray(v) ? v.version : undefined;
     if (!isCanonicalVersion(id)) {
-      const key = typeof id === 'string' ? id : `__invalid_${JSON.stringify(id)}`;
+      // Use index to avoid collisions between multiple invalid entries
+      const key = typeof id === 'string' && id.length > 0 ? id : `__invalid_${idx}`;
       addCode(failedGates, key, 'INVALID_VERSION');
-      continue;
+      return;
     }
     counts.set(id, (counts.get(id) || 0) + 1);
     canonicalList.push({ id, v });
-  }
+  });
 
   const versionMap = new Map();
   for (const { id, v } of canonicalList) {
