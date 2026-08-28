@@ -13,7 +13,6 @@ app.use((err, req, res, next) => {
 const TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
 const CANON_INT_RE = /^[1-9]\d*$/;
 
-// ---------- helpers ----------
 function isFiniteNum(x) {
   return typeof x === 'number' && Number.isFinite(x);
 }
@@ -36,7 +35,6 @@ function parseTimestamp(ts) {
   return ms;
 }
 
-// Safe against Object.prototype pollution (e.g. key === "constructor", "toString", etc.)
 function addCode(map, key, code) {
   if (!Object.prototype.hasOwnProperty.call(map, key) || !Array.isArray(map[key])) {
     map[key] = [];
@@ -44,7 +42,6 @@ function addCode(map, key, code) {
   if (!map[key].includes(code)) map[key].push(code);
 }
 
-// ---------- policy validation ----------
 function validatePolicy(policy, asOfMs) {
   if (asOfMs === null) return false;
   if (!policy || typeof policy !== 'object' || Array.isArray(policy)) return false;
@@ -70,7 +67,6 @@ function validatePolicy(policy, asOfMs) {
   return true;
 }
 
-// ---------- per-version gate evaluation ----------
 function evaluateVersion(v, policy, asOfMs) {
   const codes = [];
   const ev = v.evaluation;
@@ -132,7 +128,6 @@ function evaluateVersion(v, policy, asOfMs) {
   return { codes: uniqueSorted, eligible: uniqueSorted.length === 0, ev };
 }
 
-// ---------- main endpoint ----------
 app.post('/promote', (req, res) => {
   try {
     const body = req.body;
@@ -150,7 +145,6 @@ app.post('/promote', (req, res) => {
     const asOfMs = parseTimestamp(body.asOf);
     const failedGates = {};
 
-    // Step 3: canonicalize + dedupe BEFORE building lookup map
     const counts = new Map();
     const canonicalList = [];
 
@@ -174,7 +168,6 @@ app.post('/promote', (req, res) => {
       versionMap.set(id, v);
     }
 
-    // Step 4: policy validation
     const policyValid = validatePolicy(policy, asOfMs);
     if (!policyValid) {
       for (const id of versionMap.keys()) {
@@ -191,9 +184,11 @@ app.post('/promote', (req, res) => {
       });
     }
 
-    // Step 5: evaluate each surviving version
     const results = new Map();
     for (const [id, v] of versionMap.entries()) {
+      if (!Object.prototype.hasOwnProperty.call(failedGates, id)) {
+        failedGates[id] = [];
+      }
       const r = evaluateVersion(v, policy, asOfMs);
       results.set(id, r);
       if (r.codes.length) {
@@ -203,7 +198,6 @@ app.post('/promote', (req, res) => {
 
     const eligibleIds = [...results.entries()].filter(([, r]) => r.eligible).map(([id]) => id);
 
-    // Rank eligible versions: accuracy desc, latency asc, size asc, version numeric asc
     const ranked = eligibleIds
       .map(id => ({ id, ev: results.get(id).ev }))
       .sort((a, b) => {
@@ -215,7 +209,6 @@ app.post('/promote', (req, res) => {
 
     const eligibleVersionsSorted = ranked.map(r => r.id);
 
-    // Step 6: champion validity check
     const championResult = versionMap.has(championVersion) ? results.get(championVersion) : null;
     const championValid = championResult && championResult.eligible;
 
@@ -234,7 +227,6 @@ app.post('/promote', (req, res) => {
     const winner = ranked[0];
     const championEv = results.get(championVersion).ev;
 
-    // Step 8: promote vs retain
     let action, selectedVersion, evidence, aliasMutation;
 
     if (winner.id === championVersion) {
@@ -257,7 +249,6 @@ app.post('/promote', (req, res) => {
       }
     }
 
-    // Step 9: build response
     return res.json({
       action,
       championVersion,
