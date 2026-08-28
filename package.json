@@ -1,7 +1,11 @@
 {
-  "name": "iitm-tds8-q4",
+  "name": "iitm-tds8-q3",
   "version": "1.0.0",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "express": "^4.18.2" }
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
 }
